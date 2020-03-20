@@ -4,7 +4,7 @@ from torchvision import datasets
 from torchvision import transforms
 import torch
 
-def get_dataloader(type='cifar10', data_root='', batch_size=16):
+def get_dataloader(type='cifar10', data_root='../data', batch_size=16):
     '''
     Return: train, valid and test data loader. Each loader contains (data, label) pairs
     '''

@@ -1,16 +1,12 @@
-import os
 import time
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from collections import OrderedDict
-import math
 from sklearn.cluster import KMeans
 
 class AlexNet(nn.Module):
-    def __init__(self, num_class):
+    def __init__(self, num_class, dropout=0.5):
         super(AlexNet, self).__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=11, stride=4, padding=2),
@@ -29,14 +25,26 @@ class AlexNet(nn.Module):
         )
         self.avgpool = nn.AdaptiveAvgPool2d((6, 6))
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
+            nn.Dropout(0),
             nn.Linear(256 * 6 * 6, 4096),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
+            nn.Dropout(0),
             nn.Linear(4096, 4096),
             nn.ReLU(inplace=True),
             nn.Linear(4096, num_class)
         )
+        self.layers = dict()
+        self.clusters = dict()
+        self.code_books = dict()
+        for idx, param in enumerate(self.parameters()):
+            if idx in [0, 2, 4, 6, 8]:
+                self.layers['conv_weight_{}'.format( idx // 2 + 1)] = param
+            if idx in [1, 3, 5, 7, 9]:
+                self.layers['conv_bias_{}'.format( idx // 2 + 1)] = param
+            if idx in [10, 12, 14]:
+                self.layers['fc_weight_{}'.format((idx - 10) // 2 + 1)] = param
+            if idx in [11, 13, 15]:
+                self.layers['fc_bias_{}'.format((idx - 10) // 2 + 1)] = param
     
     def forward(self, x):
         x = self.features(x)
@@ -52,13 +60,15 @@ class AlexNet(nn.Module):
     def save_model(self, save_path):
         torch.save(self.state_dict(), save_path)
     
-    def compute_acc(self, data_loader):
+    def compute_acc(self, data_loader, batch_num=-1):
         correct_pred, num_examples = 0, 0
         for i, (features, targets) in enumerate(data_loader):
             logits, probas = self.forward(features)
             _, predicted_labels = torch.max(probas, 1)
             num_examples += targets.size()[0]
             correct_pred += (predicted_labels == targets).sum()
+            if batch_num > 0 and batch_num == i-1:
+                break
         return correct_pred.float()/num_examples * 100
     
     def train_model(self, epochs, learning_rate, train_loader, valid_loader, test_loader, save_path):
@@ -132,30 +142,41 @@ class AlexNet(nn.Module):
     ########################################
     # Use linear intialization to quantize #
     ########################################
-    def k_means_quantization(self, layer, target_bit_width, retrain_epoch, train_loader, valid_loader, test_loader):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+    def k_means_quantization(self, layer, cluster_num, retrain_epoch, train_loader, valid_loader, test_loader,
+                             retrain=True, show_log=False):
         original_weight = layer.weight.data.numpy()
         original_shape = original_weight.shape
-        interval = (np.max(original_weight) - np.min(original_weight)) / (2 ** target_bit_width - 1)
-        initial_centroids = np.array([np.min(original_weight) + i * interval for i in range(2 ** target_bit_width)], dtype=np.float32).reshape(-1,1)
-        predictor = KMeans(n_clusters=2 ** target_bit_width, init=initial_centroids)
+        interval = (np.max(original_weight) - np.min(original_weight)) / (cluster_num - 1)
+        initial_centroids = np.array([np.min(original_weight) + i * interval for i in range(cluster_num)], dtype=np.float32).reshape(-1,1)
+        predictor = KMeans(n_clusters=cluster_num, init=initial_centroids)
         code_book = predictor.fit_predict(original_weight.reshape(-1, 1)).reshape(original_shape)
-        for id in range(2 ** target_bit_width):
+        for id in range(cluster_num):
             centroid = np.sum(original_weight * (code_book == id)) / np.sum(code_book == id)
             original_weight[code_book == id] = centroid
         layer.weight.data = torch.from_numpy(original_weight.astype(np.float32))
-        for epoch in range(retrain_epoch):
-            for batch_idx, (images, labels) in enumerate(train_loader):
-                logits, probas = self.forward(images)
-                cost = F.cross_entropy(logits, labels)
-                optimizer.zero_grad()
-                cost.backward()
-                for id in range(2 ** target_bit_width):
-                    gradient = np.sum(layer.weight.grad.numpy() * (code_book == id)) / np.sum(code_book == id)
-                    layer.weight.grad[code_book == id] = gradient * 1e-4
-                optimizer.step()
-                if not (batch_idx+1) % 50:
-                    with torch.no_grad():
-                        test_acc = self.compute_acc(test_loader)
-                        print('Epoch: {:0>3d}/{:0>3d} | Batch {:0>3d}/{:0>3d} | Test Accuracy: {:.2f}%'.format(epoch+1, retrain_epoch, batch_idx+1, len(train_loader), test_acc))
-
+        if retrain:
+            for epoch in range(retrain_epoch):
+                for batch_idx, (images, labels) in enumerate(train_loader):
+                    logits, probas = self.forward(images)
+                    cost = F.cross_entropy(logits, labels)
+                    cost.backward()
+                    weights = layer.weight.data.numpy()
+                    for idx in range(cluster_num):
+                        centroid = np.sum((code_book == idx) * weights) / np.sum(code_book == idx)
+                        grad = np.sum(layer.weight.grad.numpy() * (code_book == idx)) / np.sum(code_book == idx)
+                        weights[code_book == idx] = centroid - grad * 1e-4
+                    layer.weight.data = torch.from_numpy(weights)
+                    if not (batch_idx+1) % 100 and show_log:
+                        with torch.no_grad():
+                            test_acc = self.compute_acc(test_loader)
+                            print('Epoch: {:0>3d}/{:0>3d} | Batch {:0>3d}/{:0>3d} | '
+                                  'Test Accuracy: {:.2f}%'.format(epoch+1, retrain_epoch,
+                                                                  batch_idx+1, len(train_loader), test_acc))
+                    if batch_idx >= 100:
+                        break
+        with torch.no_grad():
+            test_acc = self.compute_acc(test_loader)
+            valid_acc = self.compute_acc(valid_loader)
+            print('Clusters: {:0>3d} | Test Accuracy: {:.2f}% | Valid Accuracy:'
+                  ' {:.2f}%'.format(cluster_num, test_acc, valid_acc))
+        return valid_acc.item()
