@@ -1,5 +1,4 @@
 /AlexNet/data/cifar-10-batches-py/
 /AlexNet/model/
 *.pth
-/data/cifar-10-batches-py
 *.npy
