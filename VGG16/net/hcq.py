@@ -1,54 +1,44 @@
-from net.model import AlexNet
+from net.vgg16 import VGG16
 import numpy as np
 import torch
 import torch.nn.functional as F
 import copy
 import time
+import math
+import json
+from collections import OrderedDict
+import os
 
-class HCQ(AlexNet):
+class HCQ(VGG16):
 
-    def __init__(self, num_class, dropout=0.5):
-        super(HCQ, self).__init__(num_class, dropout=dropout)
+    def __init__(self, num_classes=10, batch_norm=False, dropout=0.5):
+        super(HCQ, self).__init__(num_classes=num_classes, batch_norm=batch_norm, dropout=dropout)
         self.linkage = {}
-        def single_linkage(a, b, enlarge):
-            if enlarge:
-                a = np.exp(a)
-                b = np.exp(b)
+        def single_linkage(a, b):
             return np.min(b) - np.max(a)
-        def complete_linkage(a, b, enlarge):
-            if enlarge:
-                a = np.exp(a)
-                b = np.exp(b)
+        def complete_linkage(a, b):
             return np.max(b) - np.min(a)
-        def avg_linkage(a, b, enlarge):
-            if enlarge:
-                a = np.exp(a)
-                b = np.exp(b)
+        def avg_linkage(a, b):
             dist = 0
             for i in a:
                 for j in b:
                     dist += abs(j - i)
             return dist / (len(a) * len(b))
-        # Use distance of clusters' mean value
-        def designed_linkage(a, b, enlarge):
-            if enlarge:
-                a = np.exp(a)
-                b = np.exp(b)
+        def designed_linkage(a, b):
             return np.mean(b) - np.mean(a)
         self.linkage['single'] = single_linkage
         self.linkage['complete'] = complete_linkage
         self.linkage['avg'] = avg_linkage
         self.linkage['designed'] = designed_linkage
-
-
-    def cal_group_dist(self, clusters, linkage_name, enlarge=False):
+        self.code_book = {}
+    
+    def cal_group_dist(self, clusters, linkage_name):
         dist_list = []
         for i in range(len(clusters) - 1):
-            dist_list.append(self.linkage[linkage_name](clusters[i], clusters[i+1], enlarge))
+            dist_list.append(self.linkage[linkage_name](clusters[i], clusters[i+1]))
         return np.array(dist_list)
 
-
-    def hcq_initialization(self, layer_name, linkage_function, enlarge=False):
+    def hcq_initialization(self, layer_name, linkage_function):
         '''
         Initialize HCQ to 8 bits status
         :param layer_name: conv/fc_weight/bias_num
@@ -62,7 +52,7 @@ class HCQ(AlexNet):
         del sorted_data
         total_num = len(index)
         while (len(weights) >= 256):
-            weights_dist = self.cal_group_dist(weights, linkage_function, enlarge=enlarge)
+            weights_dist = self.cal_group_dist(weights, linkage_function)
             clustering_index = []
             jump = False
             for i in range(len(weights)-1):
@@ -97,25 +87,27 @@ class HCQ(AlexNet):
         changed_weights = changed_weights.reshape(self.layers[layer_name].data.numpy().shape)
         self.layers[layer_name].data = torch.from_numpy(changed_weights.astype(np.float32))
         return code_book, original_weights.reshape(self.layers[layer_name].data.numpy().shape)
-
+        
     def set_layers_status(self, status=False):
         '''
         Fix all layers, which immune from gradients update
         :return:
         '''
         for layer in self.layers:
-            if 'weight' in layer:
-                self.layers[layer].requires_grad=status
-
+            self.layers[layer].requires_grad=status
+    
     def fine_tune(self, layer_name, code_book, retrain_epoch, learning_rate, train_loader,
-                  valid_loader, test_loader, show_interval = 50):
-        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+                  valid_loader, test_loader, show_interval = 50, sample_rate=1):
+        # optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+        optimizer = torch.optim.SGD(self.parameters(), learning_rate, momentum=0.9, weight_decay=1e-5)
         baseline_valid_acc = self.compute_acc(valid_loader)
         self.set_layers_status(False)
         self.layers[layer_name].requires_grad = True
         start_time = time.time()
         for epoch in range(retrain_epoch):
             for batch_idx, (images, labels) in enumerate(train_loader):
+                if batch_idx > sample_rate * len(train_loader):
+                    break
                 logits, probas = self.forward(images)
                 cost = F.cross_entropy(logits, labels)
                 optimizer.zero_grad()
@@ -124,8 +116,6 @@ class HCQ(AlexNet):
                 weight = self.layers[layer_name].data.numpy()
                 for idx in range(np.max(code_book)+1):
                     centroid = np.sum((code_book == idx) * weight) / np.sum(code_book == idx)
-                    # grad = np.sum(self.layers[layer_name].grad.numpy() * (code_book == idx)) / np.sum(code_book == idx)
-                    # centroid = centroid - grad * learning_rate
                     weight[code_book == idx] = centroid
                 self.layers[layer_name].data = torch.from_numpy(weight.astype(np.float32))
                 if not (batch_idx+1) % show_interval:
@@ -141,13 +131,8 @@ class HCQ(AlexNet):
                         if valid_acc > baseline_valid_acc + 0.5:
                             break
         self.set_layers_status(True)
-        # centroids = np.zeros(np.max(code_book) + 1, dtype=np.float32)
-        # for idx in range(np.max(code_book) + 1):
-        #     centroids[idx] = np.sum((code_book == idx) * self.layers[layer_name].data.numpy()) / \
-        #                      np.sum((code_book == idx))
-        return code_book
-
-    def quantize_layer_under_acc_loss(self, layer_name, code_book, linkage_name, baseline_acc, valid_loader, enlarge=False):
+    
+    def quantize_layer_under_acc_loss(self, layer_name, code_book, linkage_name,clusters_num_upper_bound,  baseline_acc, valid_loader):
         '''
         QUantize Layer with target accuracy loss
         :param layer_name:
@@ -165,9 +150,9 @@ class HCQ(AlexNet):
         for idx in range(np.max(code_book)+1):
             clusters.append(self.layers[layer_name].data.numpy()[code_book == idx])
         start_time = time.time()
-        while valid_acc >= baseline_acc:
+        while valid_acc >= baseline_acc and np.max(code_book)+1 > clusters_num_upper_bound:
             original_code_book = copy.deepcopy(code_book)
-            weight_dist = self.cal_group_dist(clusters, linkage_name=linkage_name, enlarge=enlarge)
+            weight_dist = self.cal_group_dist(clusters, linkage_name=linkage_name)
             idx = int((np.where(weight_dist==np.min(weight_dist)))[0])
             clusters[idx] = list(np.concatenate((clusters[idx], clusters[idx+1]), axis=0))
             code_book[code_book == idx+1] = idx
@@ -185,17 +170,19 @@ class HCQ(AlexNet):
             for idx in range(np.max(code_book)+1):
                 update_weights[code_book == idx] = np.mean(clusters[idx])
             self.layers[layer_name].data = torch.from_numpy(update_weights.astype(np.float32))
-            valid_acc = self.compute_acc(valid_loader)
-            if valid_acc < baseline_acc:
-                self.layers[layer_name].data = torch.from_numpy(original_weights.astype(np.float32))
-                code_book = original_code_book
-                print('End quantization')
-                break
-            print('Clusters:{:>3d} | Validation Accuracy:{:.2f}% | '
-                  'Accuracy change:{:.2f}% | Accumulated time Consumption: {:.2f} mins'.format(np.max(code_book) + 1, valid_acc.item(),
-                                                   (valid_acc - original_acc).item(), (time.time() - start_time) / 60))
-            cluster_num_list.append(np.max(code_book))
-            acc_list.append(valid_acc.item())
+            num = np.max(code_book)+1
+            if num >= 200 and  num % 20 == 0 or num >= 100 and num < 200 and num % 10 == 0 or  num < 100 and num >= 64 and num % 5 == 0 or num < 64 and num % 2 == 0:
+                valid_acc = self.compute_acc(valid_loader)
+                if valid_acc < baseline_acc:
+                    self.layers[layer_name].data = torch.from_numpy(original_weights.astype(np.float32))
+                    code_book = original_code_book
+                    print('End quantization')
+                    break
+                print('Clusters:{:>3d} | Validation Accuracy:{:.2f}% | '
+                    'Accuracy change: {:.2f}% | Time: {:.2f} mins'.format(np.max(code_book) + 1, valid_acc.item(),
+                                                    (valid_acc - original_acc).item(), (time.time() - start_time) / 60))
+                cluster_num_list.append(np.max(code_book))
+                acc_list.append(valid_acc.item())
         centroids = np.zeros(np.max(code_book)+1, dtype=np.float32)
         for idx in range(np.max(code_book)+1):
             centroids[idx] = np.sum((code_book == idx) * self.layers[layer_name].data.numpy()) / \
@@ -208,5 +195,44 @@ class HCQ(AlexNet):
             reduce_weight[code_book == idx] = centroids[idx]
         self.layers[layer_name].data = torch.from_numpy(reduce_weight.astype(np.float32))
 
-    # def get_centroids(self):
-    #
+    def set_quantization_sequence(self, type, linkage_function):
+        print('############################## Set Quantization Sequence By {} ##############################'.format(type))
+        score_list = []
+        if type == 'l1 norm':
+            for layer_name in self.layers:
+                original_weights = self.layers[layer_name].data.numpy()
+                code_book, weights = self.hcq_initialization(layer_name, linkage_function)
+                quantized_weights = self.layers[layer_name].data.numpy()
+                score = np.abs((np.abs(quantized_weights) - np.abs(original_weights))).sum() * len(quantized_weights.reshape(-1)) / math.log2(len(quantized_weights.reshape(-1)))
+                score_list.append((layer_name, score))
+                print('Layer Name: {} | Score: {:.2f}'.format(layer_name, score))
+                self.code_book[layer_name] = code_book
+        sequence = sorted(score_list, key=lambda x: x[1], reverse=True)
+        self.sequence = [i[0] for i in sequence]
+        print('############################## End Quantization Sequence ##############################'.format(type))
+    
+    def quantize_layers_by_sequence(self, type, load_path, save_path, acc_loss, linkage_function, train_loader, valid_loader, test_loader):
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        self.load_from_pretrained_model(load_path)
+        self.set_quantization_sequence(type, linkage_function)
+        valid_acc = self.compute_acc(valid_loader)
+        test_acc = self.compute_acc(test_loader)
+        print('Orignal valid accuracy:{:.2f}% | Original Test accuracy:{:.2f}% | Minimal valid accuracy:{:.2f}%'.format(valid_acc, test_acc, valid_acc - acc_loss))
+        for epoch in range(1, 11):
+            real_acc_loss = acc_loss * (1 - 0.5**epoch)
+            bit_width_limit = 2
+            if epoch <= 2:
+                bit_width_limit = 4
+            elif epoch <= 5:
+                bit_width_limit = 3
+            print('\n############################## Quantization Epoch {} | Acc Loss: {} ##############################\n'.format(epoch, real_acc_loss))
+            for layer_name in self.sequence:
+                print('---------------------------------- Quantize Layer {} ----------------------------------'.format(layer_name))
+                code_book = self.code_book[layer_name]
+                self.fine_tune(layer_name, code_book, 1, 1e-4, train_loader, valid_loader, test_loader, show_interval=20, sample_rate=0.2)
+                code_book, centroids, clusters_num_list, acc_list = self.quantize_layer_under_acc_loss(layer_name, code_book, linkage_function, bit_width_limit**2, valid_acc - real_acc_loss, valid_loader)
+                self.fine_tune(layer_name, code_book, 1, 1e-4, train_loader, valid_loader, test_loader, show_interval=20, sample_rate=0.2)
+                self.code_book[layer_name] = code_book
+            self.save_model(os.path.join(save_path, 'model.pth'))
+

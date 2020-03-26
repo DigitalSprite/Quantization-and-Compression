@@ -2,47 +2,45 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models.vgg import VGG, make_layers
+from torchvision.models.resnet import ResNet, BasicBlock
 import time
-from torchvision.models import resnet18
 
-class VGG16(VGG):
+class ResNet18(ResNet):
 
-    def __init__(self, num_classes=10, batch_norm=False, dropout=0.5):
-        cfgs = {
-            'A': [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
-            'B': [64, 64, 'M', 128, 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M'],
-            'D': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'M', 512, 512, 512, 'M', 512, 512, 512, 'M'],
-            'E': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 256, 'M', 512, 512, 512, 512, 'M', 512, 512, 512, 512,
-                  'M'],
-        }
-        super(VGG16, self).__init__(features=make_layers(cfgs['D'], batch_norm=batch_norm),
-                                    num_classes=num_classes, init_weights=True)
-        self.classifier[2] = nn.Dropout(dropout)
-        self.classifier[5] = nn.Dropout(dropout)
-
-        def get_conv_layers():
-            conv_list = []
-            for i in range(1, 3):
-                for j in range(1, 3):
-                    conv_list.append('conv_weight_{}_{}'.format(i, j))
-            for i in range(3, 6):
-                for j in range(1, 4):
-                    conv_list.append('conv_weight_{}_{}'.format(i, j))
-            return conv_list
+    def __init__(self, num_classes=10):
+        super(ResNet18, self).__init__(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+        if num_classes == 10:
+            self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.layers = dict()
-        conv_idx = [0, 3, 7, 10, 14, 17, 20, 24, 27, 30, 34, 37, 40]
-        fc_idx = [0, 3, 6]
-        for idx, layer_name in enumerate(get_conv_layers()):
-            self.layers[layer_name] = self.features[conv_idx[idx]].weight
-        for idx, fc_id in enumerate(fc_idx):
-            self.layers['fc_weight_{}'.format(idx + 1)] = self.classifier[fc_id].weight
+        # self.layers['conv_weight_1'] = self.conv1.weight.data
+        for i in range(1, 3):
+            self.layers['block 1 Conv {} 1'.format(i)] = self.layer1[i-1].conv1.weight
+            self.layers['block 1 Conv {} 2'.format(i)] = self.layer1[i-1].conv2.weight
+        for i in range(1, 3):
+            self.layers['block 2 Conv {} 1'.format(i)] = self.layer2[i-1].conv1.weight
+            self.layers['block 2 Conv {} 2'.format(i)] = self.layer2[i-1].conv2.weight
+        for i in range(1, 3):
+            self.layers['block 3 Conv {} 1'.format(i)] = self.layer3[i-1].conv1.weight
+            self.layers['block 3 Conv {} 2'.format(i)] = self.layer3[i-1].conv2.weight
+        for i in range(1, 3):
+            self.layers['block 4 Conv {} 1'.format(i)] = self.layer4[i-1].conv1.weight
+            self.layers['block 4 Conv {} 2'.format(i)] = self.layer4[i-1].conv2.weight
+        self.layers['fc'] = self.fc.weight
+
 
     def forward(self, x):
-        x = self.features(x)
+        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
         x = self.avgpool(x)
-        x = x.view(x.size(0), 7*7*512)
-        logits = self.classifier(x)
+        x = x.view(x.size(0), 512)
+        logits = self.fc(x)
+        # x = self.features(x)
+        # x = self.avgpool(x)
+        # x = x.view(x.size(0), 7*7*512)
+        # logits = self.classifier(x)
         probas = F.softmax(logits, dim=1)
         return logits, probas
 
@@ -73,7 +71,7 @@ class VGG16(VGG):
                     train_loader, valid_loader, test_loader, save_path):
         optimizer = torch.optim.SGD(self.parameters(), learning_rate, momentum=momentum, weight_decay=weight_decay)
         start_time = time.time()
-        best_test_acc = 0
+        best_test_acc = self.compute_acc(test_loader)
 
         for epoch in range(start_epoch, epochs):
             self.adjust_learning_rate(optimizer, epoch, learning_rate)

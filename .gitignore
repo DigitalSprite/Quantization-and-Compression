@@ -2,3 +2,7 @@
 /AlexNet/model/
 *.pth
 *.npy
+data/
+*.pt
+*.json
+*.cpython-37.pyc
